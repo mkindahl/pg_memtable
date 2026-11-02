@@ -60,10 +60,10 @@ dsm_handle memtable_catalog_lookup(Oid relid, bool* is_memtable);
 
 void memtable_schedule_cleanup(Oid relid, dsm_handle handle, XactEvent event);
 
+bool memtable_is_new_arena(MemTableStateCacheEntry* entry);
+
 bool memtable_tuple_visible(HeapTupleHeader htup);
 
 void memtable_schedule_finalize(Oid relid);
-
-bool memtable_is_finalize_pending(Oid relid);
 
 #endif /* MEMTABLE_H */

@@ -25,4 +25,8 @@ void memtable_cache_remove(Oid relid);
 
 MemTableStateCacheEntry* memtable_get_state(Relation rel);
 
+void memtable_relcache_callback(Datum arg, Oid relid);
+
+void memtable_detach_stale_mappings(void);
+
 #endif /* MEMTABLE_CACHE_H */

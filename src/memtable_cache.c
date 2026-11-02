@@ -53,9 +53,9 @@ void memtable_cache_remove(Oid relid) {
  *
  * relfilenode holds the handle of the arena, so rd_locator.relNumber is all
  * that is needed to find it. The mapping is kept in the cache entry of the
- * relation, so it is only made once. If the handle of the entry does not
- * match relfilenode, another backend has truncated the table and replaced
- * the arena, so the old mapping is detached and the new one is made.
+ * relation, so it is only made once. The relcache callback below removes the
+ * entry when the relation is invalidated, so an entry that is found always
+ * refers to the current arena.
  */
 
 /*
@@ -63,21 +63,104 @@ void memtable_cache_remove(Oid relid) {
  * yet.
  */
 MemTableStateCacheEntry* memtable_get_state(Relation rel) {
-  dsm_handle handle = (dsm_handle)rel->rd_locator.relNumber;
+  Oid relid = RelationGetRelid(rel);
   bool found;
-  MemTableStateCacheEntry* entry =
-      memtable_cache_enter(RelationGetRelid(rel), &found);
+  MemTableStateCacheEntry* entry = memtable_cache_enter(relid, &found);
 
-  /* The arena of a table that is being created is not in pg_class yet. */
-  if (found && (entry->handle == handle ||
-                memtable_is_finalize_pending(RelationGetRelid(rel))))
-    return entry;
+  if (!found)
+    memtable_attach_arena(rel, entry);
+  return entry;
+}
 
-  if (found && entry->seg != NULL) {
-    dsm_detach(entry->seg); /* the arena was replaced by another backend */
-    entry->seg = NULL;
+/*
+ * Dropping cache entries when the relation changes
+ *
+ * A mapping stays in the cache after it has been made, which means that a
+ * backend that has read a table keeps the arena alive after another backend
+ * has dropped or truncated it. A relcache invalidation is sent for the
+ * relation in both cases, and it is always processed before this backend
+ * locks the relation again, so the callback gets the relation id in time to
+ * remove the entry before the next call to memtable_get_state.
+ *
+ * The callback can be called at any time, even in the middle of a scan, and
+ * a scan holds a copy of the entry that points into the mapping. The entry
+ * is therefore removed at once, but the mapping is only recorded and is
+ * detached when the transaction ends.
+ *
+ * The exception is an arena that this transaction created. Its entry is how
+ * memtable_finalize_new_relation finds it, and the invalidation of the new
+ * pg_class row arrives before that call, so the entry has to stay.
+ */
+
+static List* stale_handles = NIL;
+
+static void memtable_forget_entry(MemTableStateCacheEntry* entry) {
+  if (entry->seg == NULL || memtable_is_new_arena(entry))
+    return;
+
+  if (!list_member_oid(stale_handles, (Oid)entry->handle))
+    stale_handles = lappend_oid(stale_handles, (Oid)entry->handle);
+  memtable_cache_remove(entry->relid);
+}
+
+/* Called when a relation is invalidated: forget its cache entry. */
+void memtable_relcache_callback(Datum arg, Oid relid) {
+  MemoryContext oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+
+  if (relid == InvalidOid) {
+    if (local_state_cache != NULL) {
+      HASH_SEQ_STATUS status;
+      MemTableStateCacheEntry* entry;
+
+      hash_seq_init(&status, local_state_cache);
+      while ((entry = hash_seq_search(&status)) != NULL)
+        memtable_forget_entry(entry);
+    }
+  } else {
+    MemTableStateCacheEntry* entry = memtable_cache_find(relid);
+
+    if (entry != NULL)
+      memtable_forget_entry(entry);
   }
 
-  memtable_attach_arena(rel, entry);
-  return entry;
+  MemoryContextSwitchTo(oldcxt);
+}
+
+/*
+ * Detach the mappings that the callback gave up, unless the entry of some
+ * relation has started using the same segment again in the meantime. A
+ * mapping that was already detached, for example by memtable_release_arena
+ * when the table was dropped, is not found and is skipped.
+ */
+static bool memtable_handle_in_use(dsm_handle handle) {
+  HASH_SEQ_STATUS status;
+  MemTableStateCacheEntry* entry;
+
+  if (local_state_cache == NULL)
+    return false;
+
+  hash_seq_init(&status, local_state_cache);
+  while ((entry = hash_seq_search(&status)) != NULL) {
+    if (entry->handle == handle) {
+      hash_seq_term(&status);
+      return true;
+    }
+  }
+  return false;
+}
+
+/* Detach the mappings that the relcache callback has given up. */
+void memtable_detach_stale_mappings(void) {
+  ListCell* lc;
+
+  foreach (lc, stale_handles) {
+    dsm_handle handle = (dsm_handle)lfirst_oid(lc);
+    dsm_segment* seg = dsm_find_mapping(handle);
+
+    if (seg != NULL && !memtable_handle_in_use(handle))
+      dsm_detach(seg);
+  }
+
+  list_free(stale_handles);
+  stale_handles = NIL;
 }

@@ -87,11 +87,6 @@ void memtable_schedule_finalize(Oid relid) {
   MemoryContextSwitchTo(oldcxt);
 }
 
-/* Is the arena of the relation waiting to be written to pg_class? */
-bool memtable_is_finalize_pending(Oid relid) {
-  return list_member_oid(pending_finalize, relid);
-}
-
 /*
  * ProcessUtility hook: finalize the arena's relfilenode once the DDL that
  * replaced it has returned. Needed for two different reasons:
@@ -180,6 +175,8 @@ static void memtable_xact_callback(XactEvent event, void* arg) {
     /* The statement failed before its relations were finalized. */
     list_free(pending_finalize);
     pending_finalize = NIL;
+
+    memtable_detach_stale_mappings();
   }
 }
 
@@ -272,6 +269,19 @@ static void memtable_object_access(ObjectAccessType access, Oid classId,
   }
 }
 
+/* Was the arena of the cache entry created by the current transaction? */
+bool memtable_is_new_arena(MemTableStateCacheEntry* entry) {
+  ListCell* lc;
+
+  foreach (lc, pending_cleanups) {
+    MemTablePendingCleanup* item = lfirst(lc);
+
+    if (item->event == XACT_EVENT_ABORT && item->handle == entry->handle)
+      return true;
+  }
+  return false;
+}
+
 /*
  * Read-committed visibility
  */
@@ -320,6 +330,7 @@ void _PG_init(void) {
   prev_object_access_hook = object_access_hook;
   object_access_hook = memtable_object_access;
 
+  CacheRegisterRelcacheCallback(memtable_relcache_callback, (Datum)0);
   RegisterXactCallback(memtable_xact_callback, NULL);
   RegisterSubXactCallback(memtable_subxact_callback, NULL);
 }

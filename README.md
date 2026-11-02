@@ -20,12 +20,14 @@ The posts that go with the code up to this commit:
 - The arena follows the transaction: a rolled-back `CREATE TABLE` releases the arena it created, a rolled-back `DROP TABLE` keeps it, and the same holds for savepoints.
 - `TRUNCATE` gives the table a new arena, and a rolled-back `TRUNCATE` leaves the old one in place.
 - Rows can be inserted and read back with a full table scan, from any backend. Rows are stored in the heap tuple format, a TID is the offset of the row in the arena, and a row is visible once the transaction that inserted it has committed. Backward scans are not supported.
+- A backend lets go of the arena of a table that another backend has dropped or truncated, using relcache invalidation, instead of keeping the memory until it disconnects.
 
 Not done yet:
 
 - There are no `DELETE`, `UPDATE`, index or primary key yet, so the only way to find a row is to read all of them.
 - The scan only goes forward.
 - Nothing survives a server restart. The arenas are gone but the tables are still in the catalog, so reading or inserting into such a table fails. It can be dropped, or truncated, which gives it a new arena.
+- See `LIMITATIONS.md` for the rest.
 
 ## Build and install
 
@@ -70,6 +72,7 @@ The tests:
 - `insert_select`, `scan`, `toast` and `arena_full`: inserting and reading rows, the scan callbacks, values that are stored out of line in another table, and a full arena.
 - `visibility` and `create_as_other_session` (isolation tests): a row is hidden from other sessions until its transaction commits, and a table created by `CREATE TABLE AS` can be used by them.
 - `t/004_concurrent.pl` (TAP test): inserts and scans that run at the same time.
+- `t/005_cache_invalidation.pl` (TAP test): a backend releases the arena of a dropped or truncated table (Linux only).
 
 The tests that are marked Linux only count the shared memory segments that the backend has mapped by reading `/proc/<pid>/maps`.
 
