@@ -1,0 +1,46 @@
+-- Temporary tables and commands that rewrite a table are rejected, and the
+-- table is left as it was.
+CREATE TABLE t_heap (id int, name text);
+INSERT INTO t_heap VALUES (1, 'one'), (2, 'two');
+\set ON_ERROR_STOP 0
+CREATE TEMP TABLE t_temp (id int) USING memtable;
+ERROR:  temporary tables are not supported by memtable
+ALTER TABLE t_heap SET ACCESS METHOD memtable;
+ERROR:  memtable relations cannot be rewritten
+DETAIL:  ALTER TABLE commands that rewrite the table, REFRESH MATERIALIZED VIEW, CLUSTER and VACUUM FULL are not supported.
+CREATE MATERIALIZED VIEW mv_rewrite USING memtable AS SELECT * FROM t_heap;
+ERROR:  memtable relations cannot be rewritten
+DETAIL:  ALTER TABLE commands that rewrite the table, REFRESH MATERIALIZED VIEW, CLUSTER and VACUUM FULL are not supported.
+\set ON_ERROR_STOP 1
+CREATE TABLE t_mem (id int) USING memtable;
+\set ON_ERROR_STOP 0
+ALTER TABLE t_mem ALTER COLUMN id TYPE bigint;
+ERROR:  memtable relations cannot be rewritten
+DETAIL:  ALTER TABLE commands that rewrite the table, REFRESH MATERIALIZED VIEW, CLUSTER and VACUUM FULL are not supported.
+\set ON_ERROR_STOP 1
+-- WITH NO DATA does not rewrite anything, but REFRESH does
+CREATE MATERIALIZED VIEW mv_empty USING memtable AS SELECT * FROM t_heap WITH NO DATA;
+\set ON_ERROR_STOP 0
+REFRESH MATERIALIZED VIEW mv_empty;
+ERROR:  memtable relations cannot be rewritten
+DETAIL:  ALTER TABLE commands that rewrite the table, REFRESH MATERIALIZED VIEW, CLUSTER and VACUUM FULL are not supported.
+\set ON_ERROR_STOP 1
+SELECT count(*) FROM t_heap;
+ count 
+-------
+     2
+(1 row)
+
+SELECT c.relname, a.amname
+  FROM pg_class c JOIN pg_am a ON a.oid = c.relam
+ WHERE c.relname IN ('t_heap', 't_mem', 'mv_empty')
+ ORDER BY c.relname;
+ relname  |  amname  
+----------+----------
+ mv_empty | memtable
+ t_heap   | heap
+ t_mem    | memtable
+(3 rows)
+
+DROP MATERIALIZED VIEW mv_empty;
+DROP TABLE t_mem, t_heap;

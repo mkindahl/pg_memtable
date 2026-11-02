@@ -16,22 +16,28 @@
 # Linux.
 
 MODULE_big = memtable
-OBJS = src/memtable.o src/memtable_handler.o
+OBJS = src/memtable.o src/memtable_shmem.o src/memtable_cache.o src/memtable_handler.o
 PG_CPPFLAGS = -Isrc
 
 EXTENSION = memtable
 DATA = memtable--0.1.sql
 PGFILEDESC = "memtable - table access method that keeps rows in shared memory"
 
-REGRESS = create_table
+REGRESS = create_table create_as unsupported
+ifeq ($(shell uname -s),Linux)
+REGRESS += arena
+endif
 REGRESS_OPTS = --load-extension=memtable
+TAP_TESTS = 1
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
-src/memtable.o: src/memtable.c src/memtable.h
-src/memtable_handler.o: src/memtable_handler.c src/memtable.h
+src/memtable.o: src/memtable.c src/memtable.h src/memtable_shmem.h src/memtable_cache.h
+src/memtable_shmem.o: src/memtable_shmem.c src/memtable_shmem.h src/memtable_cache.h src/memtable.h
+src/memtable_cache.o: src/memtable_cache.c src/memtable_cache.h src/memtable_shmem.h src/memtable.h
+src/memtable_handler.o: src/memtable_handler.c src/memtable_shmem.h src/memtable_cache.h src/memtable.h
 
 # PGXS does not support "make check", so start a temporary instance that
 # preloads the module from this directory and has the extension files in
@@ -47,3 +53,4 @@ check-temp: all
 	echo "extension_control_path = '$(TEMP_DIR)/ext:\$$system'" >> '$(TEMP_DIR)/temp.conf'
 	echo "dynamic_library_path = '$(CURDIR):\$$libdir'" >> '$(TEMP_DIR)/temp.conf'
 	$(pg_regress_installcheck) --temp-instance='$(TEMP_DIR)/instance' --temp-config='$(TEMP_DIR)/temp.conf' $(REGRESS_OPTS) $(REGRESS)
+	$(prove_installcheck)

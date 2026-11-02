@@ -1,18 +1,18 @@
-#include "memtable.h"
+#include "memtable_cache.h"
 
-/* ------------------------------------------------------------------------
+/*
  * Slot related callbacks
- * ------------------------------------------------------------------------ */
+ */
 
 /* The kind of tuple table slot that the executor uses for the table. */
 static const TupleTableSlotOps* memtable_slot_callbacks(Relation rel) {
-  NOT_IMPLEMENTED;
-  return NULL;
+  return &TTSOpsHeapTuple;
 }
 
-/* ------------------------------------------------------------------------
- * Table scan callbacks
- * ------------------------------------------------------------------------ */
+/*
+ * Table scan callbacks -- not yet: this post only covers the arena's
+ * lifecycle, not reading or writing tuples in it.
+ */
 
 /* Start a scan of the table. */
 static TableScanDesc memtable_scan_begin(Relation rel, Snapshot snapshot,
@@ -24,19 +24,19 @@ static TableScanDesc memtable_scan_begin(Relation rel, Snapshot snapshot,
 }
 
 /* End a scan and release what it holds. */
-static void memtable_scan_end(TableScanDesc scan) {
+static void memtable_scan_end(TableScanDesc sscan) {
   NOT_IMPLEMENTED;
 }
 
 /* Restart a scan that is already open. */
-static void memtable_scan_rescan(TableScanDesc scan, struct ScanKeyData* key,
+static void memtable_scan_rescan(TableScanDesc sscan, struct ScanKeyData* key,
                                  bool set_params, bool allow_strat,
                                  bool allow_sync, bool allow_pagemode) {
   NOT_IMPLEMENTED;
 }
 
 /* Store the next visible row of the scan in a slot. */
-static bool memtable_scan_getnextslot(TableScanDesc scan,
+static bool memtable_scan_getnextslot(TableScanDesc sscan,
                                       ScanDirection direction,
                                       TupleTableSlot* slot) {
   NOT_IMPLEMENTED;
@@ -57,9 +57,9 @@ static bool memtable_scan_getnextslot_tidrange(TableScanDesc scan,
   return false;
 }
 
-/* ------------------------------------------------------------------------
+/*
  * Parallel table scan related functions
- * ------------------------------------------------------------------------ */
+ */
 
 /* Size of the shared state of a parallel scan. */
 static Size memtable_parallelscan_estimate(Relation rel) {
@@ -80,9 +80,9 @@ static void memtable_parallelscan_reinitialize(Relation rel,
   NOT_IMPLEMENTED;
 }
 
-/* ------------------------------------------------------------------------
- * Index scan callbacks
- * ------------------------------------------------------------------------ */
+/*
+ * Index scan callbacks -- no index yet
+ */
 
 /* Start fetching rows by TID for an index scan. */
 static struct IndexFetchTableData* memtable_index_fetch_begin(Relation rel) {
@@ -109,9 +109,9 @@ static bool memtable_index_fetch_tuple(struct IndexFetchTableData* scan,
   return false;
 }
 
-/* ------------------------------------------------------------------------
+/*
  * Callbacks for non-modifying operations on individual tuples
- * ------------------------------------------------------------------------ */
+ */
 
 /* Fetch the row with the given TID if it is visible to the snapshot. */
 static bool memtable_tuple_fetch_row_version(Relation rel, ItemPointer tid,
@@ -147,9 +147,9 @@ static TransactionId memtable_index_delete_tuples(Relation rel,
   return InvalidTransactionId;
 }
 
-/* ------------------------------------------------------------------------
+/*
  * Manipulations of physical tuples
- * ------------------------------------------------------------------------ */
+ */
 
 /* Insert the row in the slot into the table. */
 static void memtable_tuple_insert(Relation rel, TupleTableSlot* slot,
@@ -211,16 +211,41 @@ static TM_Result memtable_tuple_lock(Relation rel, ItemPointer tid,
   return TM_Ok;
 }
 
-/* finish_bulk_insert is the one optional callback -- left NULL below. */
-
-/* ------------------------------------------------------------------------
+/*
  * DDL related functionality
- * ------------------------------------------------------------------------ */
+ */
 
 /* Create the storage of a new table, or a new empty storage for TRUNCATE. */
 static void memtable_relation_set_new_filelocator(
     Relation rel, const RelFileLocator* newrlocator, char persistence,
     TransactionId* freezeXid, MultiXactId* minmulti) {
+  Oid relid = RelationGetRelid(rel);
+  MemTableStateCacheEntry* entry;
+
+  if (persistence == RELPERSISTENCE_TEMP)
+    ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                    errmsg("temporary tables are not supported by memtable")));
+
+  /*
+   * A command that rewrites a table copies the rows into a new table, named
+   * pg_temp_<oid> by make_new_heap, and then swaps the files of the two
+   * tables. The handle of an arena is a file number that is swapped with the
+   * other table, so this cannot work.
+   */
+  if (strncmp(RelationGetRelationName(rel), "pg_temp_", 8) == 0)
+    ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+             errmsg("memtable relations cannot be rewritten"),
+             errdetail("ALTER TABLE commands that rewrite the table, REFRESH "
+                       "MATERIALIZED VIEW, CLUSTER and VACUUM FULL are not "
+                       "supported.")));
+
+  entry = memtable_cache_enter(relid);
+  memtable_create_arena(entry);
+
+  /* The handle goes into pg_class.relfilenode when the statement is done. */
+  memtable_schedule_finalize(relid);
+
   *freezeXid = InvalidTransactionId;
   *minmulti = InvalidMultiXactId;
 }
@@ -287,9 +312,9 @@ static void memtable_index_validate_scan(Relation table_rel, Relation index_rel,
   NOT_IMPLEMENTED;
 }
 
-/* ------------------------------------------------------------------------
+/*
  * Miscellaneous functions
- * ------------------------------------------------------------------------ */
+ */
 
 /* The size of the table in bytes. */
 static uint64 memtable_relation_size(Relation rel, ForkNumber forkNumber) {
@@ -318,20 +343,24 @@ static void memtable_relation_fetch_toast_slice(Relation toastrel, Oid valueid,
   NOT_IMPLEMENTED;
 }
 
-/* ------------------------------------------------------------------------
+/*
  * Planner related functions
- * ------------------------------------------------------------------------ */
+ */
 
 /* Estimate the number of pages and rows, for the planner. */
 static void memtable_relation_estimate_size(Relation rel, int32* attr_widths,
                                             BlockNumber* pages, double* tuples,
                                             double* allvisfrac) {
-  NOT_IMPLEMENTED;
+  /* No real cost model yet -- just enough for the planner to pick a
+   * sequential scan without erroring out. */
+  *pages = 1;
+  *tuples = 0;
+  *allvisfrac = 1.0;
 }
 
-/* ------------------------------------------------------------------------
+/*
  * Executor related functions
- * ------------------------------------------------------------------------ */
+ */
 
 /* Return the next row of a bitmap heap scan. */
 static bool memtable_scan_bitmap_next_tuple(TableScanDesc scan,
@@ -357,9 +386,9 @@ static bool memtable_scan_sample_next_tuple(TableScanDesc scan,
   return false;
 }
 
-/* ------------------------------------------------------------------------
+/*
  * The routine itself
- * ------------------------------------------------------------------------ */
+ */
 
 static const TableAmRoutine memtable_methods = {
     .type = T_TableAmRoutine,

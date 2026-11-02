@@ -1,0 +1,25 @@
+-- Creating a table creates an arena, and dropping the table releases
+-- it. The arena is a DSM segment, so it shows up as a mapping of
+-- /dev/shm/PostgreSQL.* in this backend (Linux).
+CREATE FUNCTION pg_temp.mapped_arenas() RETURNS int LANGUAGE sql AS $$
+  SELECT count(*)::int
+    FROM regexp_split_to_table(pg_read_file('/proc/self/maps'), E'\n') AS l
+   WHERE l LIKE '%/dev/shm/PostgreSQL.%'
+$$;
+
+SELECT pg_temp.mapped_arenas() AS base \gset
+
+CREATE TABLE t_arena (id int) USING memtable;
+SELECT pg_temp.mapped_arenas() - :base AS arenas_after_create;
+
+-- relfilenode holds the handle of the arena, which is never zero
+SELECT relfilenode <> 0 AS has_handle FROM pg_class WHERE relname = 't_arena';
+
+CREATE TABLE t_arena2 (id int) USING memtable;
+SELECT pg_temp.mapped_arenas() - :base AS arenas_after_second_create;
+
+DROP TABLE t_arena;
+SELECT pg_temp.mapped_arenas() - :base AS arenas_after_first_drop;
+
+DROP TABLE t_arena2;
+SELECT pg_temp.mapped_arenas() - :base AS arenas_after_second_drop;
