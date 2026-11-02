@@ -1,0 +1,5 @@
+comment = 'MemTable - table access method that keeps rows in shared memory'
+default_version = '0.1'
+module_pathname = '$libdir/memtable'
+relocatable = false
+schema = 'memtable'
