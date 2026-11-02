@@ -220,6 +220,7 @@ static void memtable_relation_set_new_filelocator(
     Relation rel, const RelFileLocator* newrlocator, char persistence,
     TransactionId* freezeXid, MultiXactId* minmulti) {
   Oid relid = RelationGetRelid(rel);
+  dsm_handle old_handle;
   MemTableStateCacheEntry* entry;
   dsm_handle handle;
 
@@ -241,6 +242,7 @@ static void memtable_relation_set_new_filelocator(
                        "MATERIALIZED VIEW, CLUSTER and VACUUM FULL are not "
                        "supported.")));
 
+  old_handle = memtable_catalog_lookup(relid, NULL);
   entry = memtable_cache_enter(relid);
   handle = memtable_create_arena(entry);
 
@@ -250,13 +252,41 @@ static void memtable_relation_set_new_filelocator(
   /* If this transaction aborts, don't leak the arena just created. */
   memtable_schedule_cleanup(relid, handle, XACT_EVENT_ABORT);
 
+  /* If this transaction commits, and there were an old arena, clean it up. */
+  if (old_handle != DSM_HANDLE_INVALID)
+    memtable_schedule_cleanup(relid, old_handle, XACT_EVENT_COMMIT);
+
   *freezeXid = InvalidTransactionId;
   *minmulti = InvalidMultiXactId;
 }
 
 /* Empty a table in place, when it was created in the same transaction. */
 static void memtable_relation_nontransactional_truncate(Relation rel) {
-  NOT_IMPLEMENTED;
+  MemTableStateCacheEntry* entry = memtable_cache_find(RelationGetRelid(rel));
+  dsm_segment* attached = NULL;
+  MemTableArenaHeader* hdr;
+
+  if (entry != NULL) {
+    hdr = entry->hdr;
+  } else {
+    /* No cache entry, but relfilenode is still the handle of the arena. */
+    dsm_handle handle = (dsm_handle)rel->rd_locator.relNumber;
+    dsm_segment* seg = dsm_find_mapping(handle);
+
+    if (seg == NULL)
+      seg = attached = dsm_attach(handle);
+    if (seg == NULL)
+      ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+                      errmsg("could not attach to arena %u", handle)));
+    hdr = dsm_segment_address(seg);
+  }
+
+  LWLockAcquire(&hdr->lock, LW_EXCLUSIVE);
+  hdr->tuple_free = MAXALIGN(sizeof(MemTableArenaHeader));
+  LWLockRelease(&hdr->lock);
+
+  if (attached != NULL)
+    dsm_detach(attached);
 }
 
 /* Copy the storage of a table to a new file locator. */

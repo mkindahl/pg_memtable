@@ -42,6 +42,8 @@ typedef struct MemTableStateCacheEntry MemTableStateCacheEntry;
 
 /* Support functions in memtable.c that the other files use */
 
+dsm_handle memtable_catalog_lookup(Oid relid, bool* is_memtable);
+
 void memtable_schedule_cleanup(Oid relid, dsm_handle handle, XactEvent event);
 
 void memtable_schedule_finalize(Oid relid);

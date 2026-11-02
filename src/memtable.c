@@ -12,7 +12,7 @@ static ProcessUtility_hook_type prev_ProcessUtility = NULL;
  * relation's arena, and report whether the relation uses memtable. Returns
  * DSM_HANDLE_INVALID if there is no pg_class row (yet) for relid.
  */
-static dsm_handle memtable_catalog_lookup(Oid relid, bool* is_memtable) {
+dsm_handle memtable_catalog_lookup(Oid relid, bool* is_memtable) {
   HeapTuple tup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
 
   if (HeapTupleIsValid(tup)) {
@@ -36,7 +36,7 @@ static dsm_handle memtable_catalog_lookup(Oid relid, bool* is_memtable) {
 }
 
 /*
- * Called after CREATE TABLE completes, once the arena's real DSM
+ * Called after CREATE TABLE or TRUNCATE completes, once the arena's real DSM
  * handle can safely be written to pg_class.relfilenode.
  *
  * This function is a no-op if the relation is not in the cache, which could be
@@ -54,8 +54,6 @@ static void memtable_finalize_new_relation(Oid relid) {
     dsm_handle handle = dsm_segment_handle(entry->seg);
     Relation pg_class_rel = table_open(RelationRelationId, RowExclusiveLock);
     HeapTuple tup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
-
-    memtable_cache_remove(relid); /* the handle is all that is needed now */
 
     if (HeapTupleIsValid(tup)) {
       Form_pg_class classForm = (Form_pg_class)GETSTRUCT(tup);
@@ -91,10 +89,17 @@ void memtable_schedule_finalize(Oid relid) {
 
 /*
  * ProcessUtility hook: finalize the arena's relfilenode once the DDL that
- * created it has returned. pg_class doesn't have a row yet when our TAM
- * callback runs (see memtable_finalize_new_relation's own comment).
+ * replaced it has returned. Needed for two different reasons:
  *
- * The statement does not have to be a CREATE TABLE. A table is
+ *   - CREATE TABLE: pg_class doesn't have a row yet when our TAM callback
+ *     runs (see memtable_finalize_new_relation's own comment).
+ *   - TRUNCATE: pg_class *does* have a row, but RelationSetNewRelfilenumber
+ *     (relcache.c) writes its own freshly allocated relfilenumber into it
+ *     immediately after calling our callback, clobbering anything we'd try
+ *     to write synchronously. We have to overwrite it again afterward, same
+ *     as CREATE TABLE, just for a different reason.
+ *
+ * The statement does not have to be a CREATE TABLE or a TRUNCATE. A table is
  * also created by CREATE TABLE AS, SELECT INTO and CREATE MATERIALIZED VIEW,
  * so the callback that creates the arena schedules the relation, and every
  * relation that was scheduled by the statement is finalized here.
@@ -128,12 +133,16 @@ static void memtable_ProcessUtility(PlannedStmt* pstmt, const char* queryString,
 /*
  * Arena lifecycle cleanup -- deferred to transaction end
  *
- * Two different events can mean an arena needs to go away, and both need the
- * same protection. DROP TABLE can still roll back, so the arena can't be torn
- * down the moment object_access_hook sees the drop. It has to wait for the
- * transaction to actually commit. Symmetrically, if CREATE TABLE itself rolls
- * back, the arena it already created needs to be torn down on abort instead.
- * One pending-list/xact-callback mechanism covers both.
+ * Three different events can mean an arena needs to go away, and all three
+ * need the same protection. DROP TABLE can still roll back, so the arena
+ * can't be torn down the moment object_access_hook sees the drop; it has
+ * to wait for the transaction to actually commit. Symmetrically, if
+ * CREATE TABLE itself rolls back, the arena it already created (before the
+ * transaction had any chance to fail) needs to be torn down on abort
+ * instead. And the *old* arena TRUNCATE replaces needs the same treatment
+ * as DROP TABLE: released on commit, left alone if the transaction aborts
+ * (see memtable_create_arena). One pending-list/xact-callback mechanism
+ * covers all three.
  */
 
 typedef struct MemTablePendingCleanup {
@@ -146,18 +155,6 @@ typedef struct MemTablePendingCleanup {
 static List* pending_cleanups = NIL;
 
 static void memtable_xact_callback(XactEvent event, void* arg) {
-  /*
-   * A prepared transaction is finished later, possibly by another backend,
-   * and there is no callback for COMMIT PREPARED or ROLLBACK PREPARED, so the
-   * pending entries could never be resolved at the right time. Raising an
-   * error here is still allowed, and aborts the transaction.
-   */
-  if (event == XACT_EVENT_PRE_PREPARE && pending_cleanups != NIL)
-    ereport(ERROR,
-            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-             errmsg("cannot PREPARE a transaction that has created or dropped "
-                    "a memtable relation")));
-
   if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT) {
     ListCell* lc;
     foreach (lc, pending_cleanups) {
@@ -186,7 +183,7 @@ static void memtable_xact_callback(XactEvent event, void* arg) {
  * top-level callback above only runs once the whole transaction ends -- by
  * which time the top level may well commit. Without this, a rolled-back
  * DROP TABLE would still release its arena at the top-level commit, and a
- * rolled-back CREATE TABLE would leak the arena it created.
+ * rolled-back CREATE TABLE or TRUNCATE would leak the arena it created.
  *
  * On abort, resolve the items scheduled in this subtransaction now: release
  * the ones waiting for ABORT, discard the ones waiting for COMMIT. On commit,
@@ -213,7 +210,7 @@ static void memtable_subxact_callback(SubXactEvent event,
 
     /*
      * Only an arena being released is what the local state entry points at;
-     * an item waiting for COMMIT (DROP) leaves it alone.
+     * an item waiting for COMMIT (DROP, the old arena) leaves it alone.
      */
     if (item->event == XACT_EVENT_ABORT && item->handle != DSM_HANDLE_INVALID) {
       memtable_release_arena(item->handle);
@@ -229,11 +226,11 @@ static void memtable_subxact_callback(SubXactEvent event,
  * Schedule releasing the arena named by handle when the current transaction
  * ends with the given event (COMMIT or ABORT). At that point the segment is
  * unpinned, and this backend's mapping is detached if it has one; the mapping
- * is looked up by handle when the callback runs, since DROP TABLE never mapped
- * the arena in this backend if another backend created it. The relid's local
- * state entry is dropped when the transaction ends, whichever event it is. The
- * item is tagged with the current subtransaction so a ROLLBACK TO SAVEPOINT
- * can resolve it early (see memtable_subxact_callback).
+ * is looked up by handle when the callback runs, since many callers (DROP, the
+ * old arena replaced by TRUNCATE) never mapped the arena in this backend. The
+ * relid's local state entry is dropped when the transaction ends, whichever
+ * event it is. The item is tagged with the current subtransaction so a
+ * ROLLBACK TO SAVEPOINT can resolve it early (see memtable_subxact_callback).
  */
 void memtable_schedule_cleanup(Oid relid, dsm_handle handle, XactEvent event) {
   MemoryContext oldcxt = MemoryContextSwitchTo(TopMemoryContext);
@@ -252,7 +249,7 @@ void memtable_schedule_cleanup(Oid relid, dsm_handle handle, XactEvent event) {
  * object_access_hook fires for every dropped object regardless of DDL
  * shape (DROP TABLE, DROP TABLE CASCADE, ...), which is simpler than trying
  * to pick apart DropStmt the way memtable_ProcessUtility picks apart
- * CreateStmt.
+ * CreateStmt/TruncateStmt.
  */
 static object_access_hook_type prev_object_access_hook = NULL;
 
