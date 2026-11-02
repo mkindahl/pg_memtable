@@ -17,10 +17,12 @@ typedef struct MemTableStateCacheEntry {
   dsm_handle handle; /* handle of the arena `seg` is attached to */
 } MemTableStateCacheEntry;
 
-MemTableStateCacheEntry* memtable_cache_enter(Oid relid);
+MemTableStateCacheEntry* memtable_cache_enter(Oid relid, bool* found);
 
 MemTableStateCacheEntry* memtable_cache_find(Oid relid);
 
 void memtable_cache_remove(Oid relid);
+
+MemTableStateCacheEntry* memtable_get_state(Relation rel);
 
 #endif /* MEMTABLE_CACHE_H */

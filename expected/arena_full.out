@@ -1,0 +1,26 @@
+-- The size of an arena is fixed when the table is created. A statement that
+-- does not fit in the arena fails and leaves the table as it was.
+SET memtable.arena_size = 64;
+CREATE TABLE t_full (id int, v text) USING memtable;
+RESET memtable.arena_size;
+INSERT INTO t_full VALUES (1, 'one');
+\set ON_ERROR_STOP 0
+INSERT INTO t_full SELECT g, repeat('x', 100) FROM generate_series(1, 10000) g;
+ERROR:  memtable arena is full
+HINT:  Increase memtable.arena_size before the table is created.
+\set ON_ERROR_STOP 1
+SELECT count(*) FROM t_full;
+ count 
+-------
+     1
+(1 row)
+
+INSERT INTO t_full VALUES (2, 'two');
+SELECT id, v FROM t_full ORDER BY id;
+ id |  v  
+----+-----
+  1 | one
+  2 | two
+(2 rows)
+
+DROP TABLE t_full;

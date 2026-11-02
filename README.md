@@ -19,11 +19,13 @@ The posts that go with the code up to this commit:
 - Creating a table, with `CREATE TABLE`, `CREATE TABLE AS` or `SELECT INTO`, creates an arena, a shared memory (DSM) segment that will hold the rows of the table. Its handle is stored in `pg_class.relfilenode`, so every backend can attach to it. Dropping the table releases the arena. Temporary tables, and commands that rewrite a table, are rejected with an error.
 - The arena follows the transaction: a rolled-back `CREATE TABLE` releases the arena it created, a rolled-back `DROP TABLE` keeps it, and the same holds for savepoints.
 - `TRUNCATE` gives the table a new arena, and a rolled-back `TRUNCATE` leaves the old one in place.
+- Rows can be inserted and read back with a full table scan, from any backend. Rows are stored in the heap tuple format, a TID is the offset of the row in the arena, and a row is visible once the transaction that inserted it has committed. Backward scans are not supported.
 
 Not done yet:
 
-- Rows cannot be stored yet, so there is nothing to insert or read.
-- Nothing survives a server restart. The arenas are gone but the tables are still in the catalog. Such a table can be dropped, or truncated, which gives it a new arena.
+- There are no `DELETE`, `UPDATE`, index or primary key yet, so the only way to find a row is to read all of them.
+- The scan only goes forward.
+- Nothing survives a server restart. The arenas are gone but the tables are still in the catalog, so reading or inserting into such a table fails. It can be dropped, or truncated, which gives it a new arena.
 
 ## Build and install
 
@@ -65,6 +67,9 @@ The tests:
 - `transactions`: the arena follows commit, abort and savepoints (Linux only).
 - `truncate`: `TRUNCATE` and its rollback (Linux only).
 - `t/003_restart_truncate.pl` (TAP test): a table from before a restart can be truncated.
+- `insert_select`, `scan`, `toast` and `arena_full`: inserting and reading rows, the scan callbacks, values that are stored out of line in another table, and a full arena.
+- `visibility` and `create_as_other_session` (isolation tests): a row is hidden from other sessions until its transaction commits, and a table created by `CREATE TABLE AS` can be used by them.
+- `t/004_concurrent.pl` (TAP test): inserts and scans that run at the same time.
 
 The tests that are marked Linux only count the shared memory segments that the backend has mapped by reading `/proc/<pid>/maps`.
 

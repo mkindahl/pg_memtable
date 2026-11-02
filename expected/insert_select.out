@@ -1,0 +1,90 @@
+-- Rows can be inserted and read back.
+CREATE TABLE t_rows (id bigint, name text) USING memtable;
+INSERT INTO t_rows VALUES (1, 'one'), (2, 'two');
+INSERT INTO t_rows VALUES (3, NULL);
+SELECT id, name FROM t_rows ORDER BY id;
+ id | name 
+----+------
+  1 | one
+  2 | two
+  3 | 
+(3 rows)
+
+SELECT count(*) FROM t_rows;
+ count 
+-------
+     3
+(1 row)
+
+-- a row is visible to its own transaction, and a rolled-back row to nobody
+BEGIN;
+INSERT INTO t_rows VALUES (4, 'four');
+SELECT count(*) FROM t_rows;
+ count 
+-------
+     4
+(1 row)
+
+ROLLBACK;
+SELECT count(*) FROM t_rows;
+ count 
+-------
+     3
+(1 row)
+
+-- a statement does not see the rows it inserts itself
+INSERT INTO t_rows SELECT id + 10, name FROM t_rows;
+SELECT count(*) FROM t_rows;
+ count 
+-------
+     6
+(1 row)
+
+INSERT INTO t_rows SELECT * FROM t_rows;
+SELECT count(*) FROM t_rows;
+ count 
+-------
+    12
+(1 row)
+
+-- TRUNCATE gives the table a new arena, and a rollback brings the old rows back
+BEGIN;
+TRUNCATE t_rows;
+INSERT INTO t_rows VALUES (100, 'new');
+SELECT count(*) FROM t_rows;
+ count 
+-------
+     1
+(1 row)
+
+ROLLBACK;
+SELECT count(*) FROM t_rows;
+ count 
+-------
+    12
+(1 row)
+
+-- the TID of a row is its offset in the arena
+CREATE TABLE t_tid (id int) USING memtable;
+INSERT INTO t_tid VALUES (1), (2), (3);
+SELECT ctid, id FROM t_tid ORDER BY id;
+  ctid   | id 
+---------+----
+ (0,33)  |  1
+ (0,73)  |  2
+ (0,113) |  3
+(3 rows)
+
+-- values of different sizes
+CREATE TABLE t_sizes (id int, v text) USING memtable;
+INSERT INTO t_sizes VALUES (1, ''), (2, repeat('a', 126)), (3, repeat('b', 127)), (4, repeat('c', 100000));
+SELECT id, length(v), md5(v) FROM t_sizes ORDER BY id;
+ id | length |               md5                
+----+--------+----------------------------------
+  1 |      0 | d41d8cd98f00b204e9800998ecf8427e
+  2 |    126 | e51176a47347e167ed0ed766b6de1a0c
+  3 |    127 | 7388ff23b7224d098ba1bbf86b3319f3
+  4 | 100000 | ce71a4569324fedb18dfd288d0110e73
+(4 rows)
+
+DROP TABLE t_rows, t_tid, t_sizes;

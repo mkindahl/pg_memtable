@@ -1,6 +1,18 @@
 #include "memtable_cache.h"
 
 /*
+ * Table scan callbacks
+ */
+
+typedef struct MemTableScanData {
+  TableScanDescData rs_base;
+  MemTableStateCacheEntry state;
+  arena_off_t scan_next;
+  arena_off_t scan_stop;
+  HeapTupleData htup;
+} MemTableScanData;
+
+/*
  * Slot related callbacks
  */
 
@@ -9,37 +21,71 @@ static const TupleTableSlotOps* memtable_slot_callbacks(Relation rel) {
   return &TTSOpsHeapTuple;
 }
 
-/*
- * Table scan callbacks -- not yet: this post only covers the arena's
- * lifecycle, not reading or writing tuples in it.
- */
-
 /* Start a scan of the table. */
 static TableScanDesc memtable_scan_begin(Relation rel, Snapshot snapshot,
                                          int nkeys, struct ScanKeyData* key,
                                          ParallelTableScanDesc pscan,
                                          uint32 flags) {
-  NOT_IMPLEMENTED;
-  return NULL;
+  MemTableScanData* scan = palloc0(sizeof(MemTableScanData));
+
+  scan->rs_base.rs_rd = rel;
+  scan->rs_base.rs_snapshot = snapshot;
+  scan->rs_base.rs_nkeys = nkeys;
+  scan->rs_base.rs_flags = flags;
+
+  scan->state = *memtable_get_state(rel);
+  scan->scan_next = MAXALIGN(sizeof(MemTableArenaHeader));
+  scan->scan_stop = pg_atomic_read_membarrier_u64(&scan->state.hdr->tuple_free);
+  scan->htup.t_tableOid = RelationGetRelid(rel);
+
+  return &scan->rs_base;
 }
 
 /* End a scan and release what it holds. */
 static void memtable_scan_end(TableScanDesc sscan) {
-  NOT_IMPLEMENTED;
+  pfree(sscan);
 }
 
 /* Restart a scan that is already open. */
 static void memtable_scan_rescan(TableScanDesc sscan, struct ScanKeyData* key,
                                  bool set_params, bool allow_strat,
                                  bool allow_sync, bool allow_pagemode) {
-  NOT_IMPLEMENTED;
+  MemTableScanData* scan = (MemTableScanData*)sscan;
+
+  scan->scan_next = MAXALIGN(sizeof(MemTableArenaHeader));
+  scan->scan_stop = pg_atomic_read_membarrier_u64(&scan->state.hdr->tuple_free);
 }
 
 /* Store the next visible row of the scan in a slot. */
 static bool memtable_scan_getnextslot(TableScanDesc sscan,
                                       ScanDirection direction,
                                       TupleTableSlot* slot) {
-  NOT_IMPLEMENTED;
+  MemTableScanData* scan = (MemTableScanData*)sscan;
+  char* base = scan->state.arena_base;
+
+  if (ScanDirectionIsBackward(direction))
+    ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                    errmsg("backward scans are not supported")));
+
+  while (scan->scan_next < scan->scan_stop) {
+    char* hdr_ptr = base + scan->scan_next;
+    MemTableSlotHeader* shdr = (MemTableSlotHeader*)hdr_ptr;
+    HeapTupleHeader htup_data =
+        (HeapTupleHeader)(hdr_ptr + sizeof(MemTableSlotHeader));
+    arena_off_t this_off = scan->scan_next;
+
+    scan->scan_next += MAXALIGN(sizeof(MemTableSlotHeader) + shdr->tuple_size);
+
+    if (!memtable_tuple_visible(htup_data))
+      continue;
+
+    scan->htup.t_len = shdr->tuple_size;
+    scan->htup.t_data = htup_data;
+    memtable_store_offset(this_off, &scan->htup.t_self);
+    ExecStoreHeapTuple(&scan->htup, slot, false);
+    return true;
+  }
+
   return false;
 }
 
@@ -155,7 +201,38 @@ static TransactionId memtable_index_delete_tuples(Relation rel,
 static void memtable_tuple_insert(Relation rel, TupleTableSlot* slot,
                                   CommandId cid, int options,
                                   struct BulkInsertStateData* bistate) {
-  NOT_IMPLEMENTED;
+  MemTableStateCacheEntry* state = memtable_get_state(rel);
+  HeapTuple tup = ExecFetchSlotHeapTuple(slot, true, NULL);
+  HeapTuple flat = NULL;
+  size_t total;
+  arena_off_t off;
+  char* dst;
+  HeapTupleHeader htup;
+
+  /* Values stored in the TOAST table of another table cannot be pointed to. */
+  if (HeapTupleHasExternal(tup)) {
+    flat = toast_flatten_tuple(tup, RelationGetDescr(rel));
+    tup = flat;
+  }
+
+  total = sizeof(MemTableSlotHeader) + tup->t_len;
+  off = memtable_arena_reserve(state, total);
+  dst = (char*)state->arena_base + off;
+
+  ((MemTableSlotHeader*)dst)->tuple_size = tup->t_len;
+  htup = (HeapTupleHeader)(dst + sizeof(MemTableSlotHeader));
+  memcpy(htup, tup->t_data, tup->t_len);
+
+  if (flat != NULL)
+    heap_freetuple(flat);
+
+  HeapTupleHeaderSetXmin(htup, GetCurrentTransactionId());
+  HeapTupleHeaderSetXmax(htup, InvalidTransactionId);
+  htup->t_infomask |= HEAP_XMAX_INVALID;
+
+  memtable_arena_publish(state, total);
+
+  memtable_store_offset(off, &slot->tts_tid);
 }
 
 /* Insert a row speculatively, for INSERT ... ON CONFLICT. */
@@ -177,7 +254,10 @@ static void memtable_tuple_complete_speculative(Relation rel,
 static void memtable_multi_insert(Relation rel, TupleTableSlot** slots,
                                   int nslots, CommandId cid, int options,
                                   struct BulkInsertStateData* bistate) {
-  NOT_IMPLEMENTED;
+  int i;
+
+  for (i = 0; i < nslots; i++)
+    memtable_tuple_insert(rel, slots[i], cid, options, bistate);
 }
 
 /* Delete the row with the given TID. */
@@ -221,6 +301,7 @@ static void memtable_relation_set_new_filelocator(
     TransactionId* freezeXid, MultiXactId* minmulti) {
   Oid relid = RelationGetRelid(rel);
   dsm_handle old_handle;
+  bool found;
   MemTableStateCacheEntry* entry;
   dsm_handle handle;
 
@@ -243,7 +324,7 @@ static void memtable_relation_set_new_filelocator(
                        "supported.")));
 
   old_handle = memtable_catalog_lookup(relid, NULL);
-  entry = memtable_cache_enter(relid);
+  entry = memtable_cache_enter(relid, &found);
   handle = memtable_create_arena(entry);
 
   /* The handle goes into pg_class.relfilenode when the statement is done. */
@@ -262,31 +343,12 @@ static void memtable_relation_set_new_filelocator(
 
 /* Empty a table in place, when it was created in the same transaction. */
 static void memtable_relation_nontransactional_truncate(Relation rel) {
-  MemTableStateCacheEntry* entry = memtable_cache_find(RelationGetRelid(rel));
-  dsm_segment* attached = NULL;
-  MemTableArenaHeader* hdr;
+  MemTableStateCacheEntry* state = memtable_get_state(rel);
 
-  if (entry != NULL) {
-    hdr = entry->hdr;
-  } else {
-    /* No cache entry, but relfilenode is still the handle of the arena. */
-    dsm_handle handle = (dsm_handle)rel->rd_locator.relNumber;
-    dsm_segment* seg = dsm_find_mapping(handle);
-
-    if (seg == NULL)
-      seg = attached = dsm_attach(handle);
-    if (seg == NULL)
-      ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-                      errmsg("could not attach to arena %u", handle)));
-    hdr = dsm_segment_address(seg);
-  }
-
-  LWLockAcquire(&hdr->lock, LW_EXCLUSIVE);
-  hdr->tuple_free = MAXALIGN(sizeof(MemTableArenaHeader));
-  LWLockRelease(&hdr->lock);
-
-  if (attached != NULL)
-    dsm_detach(attached);
+  LWLockAcquire(&state->hdr->lock, LW_EXCLUSIVE);
+  pg_atomic_write_u64(&state->hdr->tuple_free,
+                      MAXALIGN(sizeof(MemTableArenaHeader)));
+  LWLockRelease(&state->hdr->lock);
 }
 
 /* Copy the storage of a table to a new file locator. */

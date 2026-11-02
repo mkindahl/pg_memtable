@@ -23,11 +23,13 @@ EXTENSION = memtable
 DATA = memtable--0.1.sql
 PGFILEDESC = "memtable - table access method that keeps rows in shared memory"
 
-REGRESS = create_table create_as unsupported
+REGRESS = create_table create_as unsupported insert_select scan toast arena_full
 ifeq ($(shell uname -s),Linux)
 REGRESS += arena transactions truncate
 endif
 REGRESS_OPTS = --load-extension=memtable
+ISOLATION = visibility create_as_other_session
+ISOLATION_OPTS = --load-extension=memtable
 TAP_TESTS = 1
 
 PG_CONFIG ?= pg_config
@@ -53,4 +55,5 @@ check-temp: all
 	echo "extension_control_path = '$(TEMP_DIR)/ext:\$$system'" >> '$(TEMP_DIR)/temp.conf'
 	echo "dynamic_library_path = '$(CURDIR):\$$libdir'" >> '$(TEMP_DIR)/temp.conf'
 	$(pg_regress_installcheck) --temp-instance='$(TEMP_DIR)/instance' --temp-config='$(TEMP_DIR)/temp.conf' $(REGRESS_OPTS) $(REGRESS)
+	$(pg_isolation_regress_installcheck) --temp-instance='$(TEMP_DIR)/instance_iso' --temp-config='$(TEMP_DIR)/temp.conf' $(ISOLATION_OPTS) $(ISOLATION)
 	$(prove_installcheck)

@@ -1,0 +1,24 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_ctas s2_ctas_count s2_ctas_drop
+step s1_ctas: CREATE TABLE t_ctas USING memtable AS SELECT * FROM t_src;
+step s2_ctas_count: SELECT count(*) FROM t_ctas;
+count
+-----
+    3
+(1 row)
+
+step s2_ctas_drop: DROP TABLE t_ctas;
+
+starting permutation: s1_into s2_into_count s2_into_drop
+step s1_into: 
+    SET default_table_access_method = memtable;
+    SELECT * INTO t_into FROM t_src;
+
+step s2_into_count: SELECT count(*) FROM t_into;
+count
+-----
+    3
+(1 row)
+
+step s2_into_drop: DROP TABLE t_into;

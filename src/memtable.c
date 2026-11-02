@@ -87,6 +87,11 @@ void memtable_schedule_finalize(Oid relid) {
   MemoryContextSwitchTo(oldcxt);
 }
 
+/* Is the arena of the relation waiting to be written to pg_class? */
+bool memtable_is_finalize_pending(Oid relid) {
+  return list_member_oid(pending_finalize, relid);
+}
+
 /*
  * ProcessUtility hook: finalize the arena's relfilenode once the DDL that
  * replaced it has returned. Needed for two different reasons:
@@ -265,6 +270,36 @@ static void memtable_object_access(ObjectAccessType access, Oid classId,
     if (handle != DSM_HANDLE_INVALID && uses_memtable)
       memtable_schedule_cleanup(objectId, handle, XACT_EVENT_COMMIT);
   }
+}
+
+/*
+ * Read-committed visibility
+ */
+
+/* Is the tuple visible to the current transaction? */
+bool memtable_tuple_visible(HeapTupleHeader htup) {
+  TransactionId xmin = HeapTupleHeaderGetRawXmin(htup);
+
+  if (!(htup->t_infomask & HEAP_XMAX_INVALID))
+    return false; /* deleted, once delete exists */
+
+  if (htup->t_infomask & HEAP_XMIN_COMMITTED)
+    return true; /* an earlier scan has seen that the inserter committed */
+
+  if (TransactionIdIsCurrentTransactionId(xmin))
+    return true; /* your own uncommitted insert is visible to you */
+
+  if (!TransactionIdDidCommit(xmin))
+    return false;
+
+  /*
+   * Remember it, so that the commit status is not looked up again by every
+   * scan. It is only a hint: scans that set it at the same time set the same
+   * bit, and nothing else changes the tuple header after the row is
+   * published.
+   */
+  htup->t_infomask |= HEAP_XMIN_COMMITTED;
+  return true;
 }
 
 /*

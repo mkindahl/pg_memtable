@@ -1,0 +1,41 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_begin s1_insert s1_count s2_count s1_commit s2_count
+step s1_begin: BEGIN;
+step s1_insert: INSERT INTO t_vis VALUES (10, 'ten');
+step s1_count: SELECT count(*) FROM t_vis;
+count
+-----
+    3
+(1 row)
+
+step s2_count: SELECT count(*) FROM t_vis;
+count
+-----
+    2
+(1 row)
+
+step s1_commit: COMMIT;
+step s2_count: SELECT count(*) FROM t_vis;
+count
+-----
+    3
+(1 row)
+
+
+starting permutation: s1_begin s1_insert s2_count s1_abort s2_count
+step s1_begin: BEGIN;
+step s1_insert: INSERT INTO t_vis VALUES (10, 'ten');
+step s2_count: SELECT count(*) FROM t_vis;
+count
+-----
+    2
+(1 row)
+
+step s1_abort: ROLLBACK;
+step s2_count: SELECT count(*) FROM t_vis;
+count
+-----
+    2
+(1 row)
+

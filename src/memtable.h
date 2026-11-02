@@ -5,6 +5,7 @@
 #include <fmgr.h>
 
 #include <access/heapam.h>
+#include <access/heaptoast.h>
 #include <access/htup_details.h>
 #include <access/multixact.h>
 #include <access/tableam.h>
@@ -40,12 +41,29 @@
 /* The cache entry of a relation, defined in memtable_cache.h */
 typedef struct MemTableStateCacheEntry MemTableStateCacheEntry;
 
+/* Types shared by the source files */
+
+typedef uint64 arena_off_t;
+
+/*
+ * The TID of a tuple is its arena offset, split into the block number and
+ * offset number that the rest of Postgres expects a TID to consist of.
+ */
+
+static inline void memtable_store_offset(arena_off_t off, ItemPointer tid) {
+  ItemPointerSet(tid, off / BLCKSZ, off % BLCKSZ + 1);
+}
+
 /* Support functions in memtable.c that the other files use */
 
 dsm_handle memtable_catalog_lookup(Oid relid, bool* is_memtable);
 
 void memtable_schedule_cleanup(Oid relid, dsm_handle handle, XactEvent event);
 
+bool memtable_tuple_visible(HeapTupleHeader htup);
+
 void memtable_schedule_finalize(Oid relid);
+
+bool memtable_is_finalize_pending(Oid relid);
 
 #endif /* MEMTABLE_H */
