@@ -221,6 +221,7 @@ static void memtable_relation_set_new_filelocator(
     TransactionId* freezeXid, MultiXactId* minmulti) {
   Oid relid = RelationGetRelid(rel);
   MemTableStateCacheEntry* entry;
+  dsm_handle handle;
 
   if (persistence == RELPERSISTENCE_TEMP)
     ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -241,10 +242,13 @@ static void memtable_relation_set_new_filelocator(
                        "supported.")));
 
   entry = memtable_cache_enter(relid);
-  memtable_create_arena(entry);
+  handle = memtable_create_arena(entry);
 
   /* The handle goes into pg_class.relfilenode when the statement is done. */
   memtable_schedule_finalize(relid);
+
+  /* If this transaction aborts, don't leak the arena just created. */
+  memtable_schedule_cleanup(relid, handle, XACT_EVENT_ABORT);
 
   *freezeXid = InvalidTransactionId;
   *minmulti = InvalidMultiXactId;

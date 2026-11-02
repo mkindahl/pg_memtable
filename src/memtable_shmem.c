@@ -46,10 +46,6 @@ dsm_handle memtable_create_arena(MemTableStateCacheEntry* entry) {
 }
 
 /*
- * DROP TABLE
- */
-
-/*
  * Does the segment with the given handle still exist? A restart of the server
  * destroys every segment, but the handles stay in pg_class.relfilenode.
  */

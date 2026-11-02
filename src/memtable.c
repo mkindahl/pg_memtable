@@ -126,13 +126,133 @@ static void memtable_ProcessUtility(PlannedStmt* pstmt, const char* queryString,
 }
 
 /*
+ * Arena lifecycle cleanup -- deferred to transaction end
+ *
+ * Two different events can mean an arena needs to go away, and both need the
+ * same protection. DROP TABLE can still roll back, so the arena can't be torn
+ * down the moment object_access_hook sees the drop. It has to wait for the
+ * transaction to actually commit. Symmetrically, if CREATE TABLE itself rolls
+ * back, the arena it already created needs to be torn down on abort instead.
+ * One pending-list/xact-callback mechanism covers both.
+ */
+
+typedef struct MemTablePendingCleanup {
+  Oid relid;
+  dsm_handle handle;
+  XactEvent event;        /* release on this event */
+  SubTransactionId subid; /* innermost (sub)transaction that scheduled it */
+} MemTablePendingCleanup;
+
+static List* pending_cleanups = NIL;
+
+static void memtable_xact_callback(XactEvent event, void* arg) {
+  /*
+   * A prepared transaction is finished later, possibly by another backend,
+   * and there is no callback for COMMIT PREPARED or ROLLBACK PREPARED, so the
+   * pending entries could never be resolved at the right time. Raising an
+   * error here is still allowed, and aborts the transaction.
+   */
+  if (event == XACT_EVENT_PRE_PREPARE && pending_cleanups != NIL)
+    ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+             errmsg("cannot PREPARE a transaction that has created or dropped "
+                    "a memtable relation")));
+
+  if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT) {
+    ListCell* lc;
+    foreach (lc, pending_cleanups) {
+      MemTablePendingCleanup* item = lfirst(lc);
+
+      Assert(item->event == XACT_EVENT_COMMIT ||
+             item->event == XACT_EVENT_ABORT);
+
+      if (item->event == event && item->handle != DSM_HANDLE_INVALID)
+        memtable_release_arena(item->handle);
+
+      memtable_cache_remove(item->relid);
+      pfree(item);
+    }
+    list_free(pending_cleanups);
+    pending_cleanups = NIL;
+
+    /* The statement failed before its relations were finalized. */
+    list_free(pending_finalize);
+    pending_finalize = NIL;
+  }
+}
+
+/*
+ * A subtransaction that aborts undoes everything scheduled inside it, but the
+ * top-level callback above only runs once the whole transaction ends -- by
+ * which time the top level may well commit. Without this, a rolled-back
+ * DROP TABLE would still release its arena at the top-level commit, and a
+ * rolled-back CREATE TABLE would leak the arena it created.
+ *
+ * On abort, resolve the items scheduled in this subtransaction now: release
+ * the ones waiting for ABORT, discard the ones waiting for COMMIT. On commit,
+ * hand them to the parent, which decides when the top level ends.
+ */
+static void memtable_subxact_callback(SubXactEvent event,
+                                      SubTransactionId mySubid,
+                                      SubTransactionId parentSubid, void* arg) {
+  ListCell* lc;
+
+  if (event != SUBXACT_EVENT_COMMIT_SUB && event != SUBXACT_EVENT_ABORT_SUB)
+    return;
+
+  foreach (lc, pending_cleanups) {
+    MemTablePendingCleanup* item = lfirst(lc);
+
+    if (item->subid != mySubid)
+      continue;
+
+    if (event == SUBXACT_EVENT_COMMIT_SUB) {
+      item->subid = parentSubid;
+      continue;
+    }
+
+    /*
+     * Only an arena being released is what the local state entry points at;
+     * an item waiting for COMMIT (DROP) leaves it alone.
+     */
+    if (item->event == XACT_EVENT_ABORT && item->handle != DSM_HANDLE_INVALID) {
+      memtable_release_arena(item->handle);
+      memtable_cache_remove(item->relid);
+    }
+
+    pfree(item);
+    pending_cleanups = foreach_delete_current(pending_cleanups, lc);
+  }
+}
+
+/*
+ * Schedule releasing the arena named by handle when the current transaction
+ * ends with the given event (COMMIT or ABORT). At that point the segment is
+ * unpinned, and this backend's mapping is detached if it has one; the mapping
+ * is looked up by handle when the callback runs, since DROP TABLE never mapped
+ * the arena in this backend if another backend created it. The relid's local
+ * state entry is dropped when the transaction ends, whichever event it is. The
+ * item is tagged with the current subtransaction so a ROLLBACK TO SAVEPOINT
+ * can resolve it early (see memtable_subxact_callback).
+ */
+void memtable_schedule_cleanup(Oid relid, dsm_handle handle, XactEvent event) {
+  MemoryContext oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+  MemTablePendingCleanup* item = palloc_object(MemTablePendingCleanup);
+
+  item->relid = relid;
+  item->handle = handle;
+  item->event = event;
+  item->subid = GetCurrentSubTransactionId();
+
+  pending_cleanups = lappend(pending_cleanups, item);
+  MemoryContextSwitchTo(oldcxt);
+}
+
+/*
  * object_access_hook fires for every dropped object regardless of DDL
  * shape (DROP TABLE, DROP TABLE CASCADE, ...), which is simpler than trying
  * to pick apart DropStmt the way memtable_ProcessUtility picks apart
  * CreateStmt.
- *
- * The arena is released right away here, which is only correct if the
- * transaction commits.
  */
 static object_access_hook_type prev_object_access_hook = NULL;
 
@@ -146,7 +266,7 @@ static void memtable_object_access(ObjectAccessType access, Oid classId,
     dsm_handle handle = memtable_catalog_lookup(objectId, &uses_memtable);
 
     if (handle != DSM_HANDLE_INVALID && uses_memtable)
-      memtable_release_arena(handle);
+      memtable_schedule_cleanup(objectId, handle, XACT_EVENT_COMMIT);
   }
 }
 
@@ -167,4 +287,7 @@ void _PG_init(void) {
 
   prev_object_access_hook = object_access_hook;
   object_access_hook = memtable_object_access;
+
+  RegisterXactCallback(memtable_xact_callback, NULL);
+  RegisterSubXactCallback(memtable_subxact_callback, NULL);
 }

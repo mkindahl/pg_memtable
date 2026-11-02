@@ -10,11 +10,13 @@ The posts that go with the code up to this commit:
 - [Part 2: the minimal TAM skeleton](https://dbmsdrops.kindahl.net/2026/09/13/table-access-method-part-2/)
 - [Part 3: shared memory in Postgres](https://dbmsdrops.kindahl.net/2026/09/27/building-a-table-access-method-part-3/)
 - [Part 4: creating and dropping the arena](https://dbmsdrops.kindahl.net/2026/10/11/building-a-table-access-method-part-4/)
+- [Part 5: commit, abort, and savepoints](https://dbmsdrops.kindahl.net/2026/10/16/building-a-table-access-method-part-5/)
 
 ## What it does so far
 
 - The callbacks of the table access method exist, and `CREATE TABLE ... USING memtable` and `DROP TABLE` work. Every other callback raises an error that says it is not implemented yet.
 - Creating a table, with `CREATE TABLE`, `CREATE TABLE AS` or `SELECT INTO`, creates an arena, a shared memory (DSM) segment that will hold the rows of the table. Its handle is stored in `pg_class.relfilenode`, so every backend can attach to it. Dropping the table releases the arena. Temporary tables, and commands that rewrite a table, are rejected with an error.
+- The arena follows the transaction: a rolled-back `CREATE TABLE` releases the arena it created, a rolled-back `DROP TABLE` keeps it, and the same holds for savepoints.
 
 Not done yet:
 
@@ -58,6 +60,7 @@ The tests:
 - `create_as` and `unsupported`: tables created by `CREATE TABLE AS` and `SELECT INTO`, and the temporary tables and rewrites that are rejected.
 - `arena`: the arena of a table is created and released (Linux only).
 - `t/001_preload.pl` and `t/002_restart.pl` (TAP tests): the module has to be preloaded, and a table from before a restart can be dropped.
+- `transactions`: the arena follows commit, abort and savepoints (Linux only).
 
 The tests that are marked Linux only count the shared memory segments that the backend has mapped by reading `/proc/<pid>/maps`.
 

@@ -25,7 +25,7 @@ PGFILEDESC = "memtable - table access method that keeps rows in shared memory"
 
 REGRESS = create_table create_as unsupported
 ifeq ($(shell uname -s),Linux)
-REGRESS += arena
+REGRESS += arena transactions
 endif
 REGRESS_OPTS = --load-extension=memtable
 TAP_TESTS = 1
